@@ -1,7 +1,7 @@
 import React from 'react';
-import { Binary, FileCode, HardDriveDownload, Sparkles, Layers, Maximize2 } from 'lucide-react';
+import { Binary, FileCode, HardDriveDownload, Sparkles, Layers, Maximize2, Video } from 'lucide-react';
 
-export type ActiveTab = 'encoder' | 'decoder' | 'upscaler' | 'python' | 'spec';
+export type ActiveTab = 'encoder' | 'decoder' | 'upscaler' | 'live' | 'python' | 'spec';
 
 interface HeaderProps {
   activeTab: ActiveTab;
@@ -72,6 +72,20 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab }) => {
               <Maximize2 className="w-4 h-4 text-purple-600" />
               <span className="hidden sm:inline">10× Upscaler</span>
               <span className="sm:hidden">10×</span>
+            </button>
+
+            <button
+              id="tab-live"
+              onClick={() => setActiveTab('live')}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg transition-all ${
+                activeTab === 'live'
+                  ? 'bg-white text-stone-900 shadow-xs font-semibold'
+                  : 'text-stone-600 hover:text-stone-900 hover:bg-stone-50'
+              }`}
+            >
+              <Video className="w-4 h-4 text-rose-600" />
+              <span className="hidden sm:inline">Live Stream</span>
+              <span className="sm:hidden">Live</span>
             </button>
 
             <button

@@ -3,6 +3,7 @@ import { Header, ActiveTab } from './components/Header';
 import { EncoderView } from './components/EncoderView';
 import { DecoderView } from './components/DecoderView';
 import { UpscalerView } from './components/UpscalerView';
+import { LiveStreamView } from './components/LiveStreamView';
 import { PythonScriptView } from './components/PythonScriptView';
 import { HeaderSpecView } from './components/HeaderSpecView';
 
@@ -19,6 +20,7 @@ export default function App() {
         {activeTab === 'encoder' && <EncoderView />}
         {activeTab === 'decoder' && <DecoderView />}
         {activeTab === 'upscaler' && <UpscalerView />}
+        {activeTab === 'live' && <LiveStreamView />}
         {activeTab === 'python' && <PythonScriptView />}
         {activeTab === 'spec' && <HeaderSpecView />}
       </main>
