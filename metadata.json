@@ -1,0 +1,6 @@
+{
+  "name": "Visual Data Codec",
+  "description": "Visual binary and text data encoder and decoder using RGB and monochrome pixel grids with CRC32 verification",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
