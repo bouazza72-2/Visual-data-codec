@@ -1,7 +1,7 @@
 import React from 'react';
-import { Binary, FileCode, HardDriveDownload, Sparkles, Layers, Maximize2, Video } from 'lucide-react';
+import { Binary, FileCode, HardDriveDownload, Sparkles, Layers, Maximize2, Video, FolderArchive } from 'lucide-react';
 
-export type ActiveTab = 'encoder' | 'decoder' | 'upscaler' | 'live' | 'python' | 'spec';
+export type ActiveTab = 'encoder' | 'decoder' | 'batch' | 'upscaler' | 'live' | 'python' | 'spec';
 
 interface HeaderProps {
   activeTab: ActiveTab;
@@ -58,6 +58,20 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab }) => {
             >
               <HardDriveDownload className="w-4 h-4 text-indigo-600" />
               <span>Decoder</span>
+            </button>
+
+            <button
+              id="tab-batch"
+              onClick={() => setActiveTab('batch')}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg transition-all ${
+                activeTab === 'batch'
+                  ? 'bg-white text-stone-900 shadow-xs font-semibold'
+                  : 'text-stone-600 hover:text-stone-900 hover:bg-stone-50'
+              }`}
+            >
+              <FolderArchive className="w-4 h-4 text-amber-600" />
+              <span className="hidden sm:inline">Batch Processor</span>
+              <span className="sm:hidden">Batch</span>
             </button>
 
             <button

@@ -21,11 +21,13 @@ Features:
 
 import sys
 import os
+import re
+import glob
 import math
 import zlib
 import struct
 import random
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 
 import numpy as np
 from PIL import Image
@@ -720,6 +722,112 @@ def run_demonstration():
     print("=" * 75)
 
 
+def natural_sort_key(s: str) -> List[Any]:
+    """Helper for natural alphanumeric sorting (e.g. frame_1, frame_2, frame_10)."""
+    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
+
+
+def batch_decode_directory(
+    dir_path: str,
+    output_path: Optional[str] = None,
+    pattern: str = "*.png",
+    delimiter: bytes = b"",
+    backend: str = 'auto'
+) -> Dict[str, Any]:
+    """
+    Decodes multiple VCDC frame images found in dir_path sequentially,
+    verifying Reed-Solomon FEC and CRC32 for each frame, and concatenates
+    their payloads into a single combined output file or byte stream.
+    """
+    if not os.path.isdir(dir_path):
+        raise FileNotFoundError(f"Directory '{dir_path}' does not exist.")
+
+    search_path = os.path.join(dir_path, pattern)
+    file_paths = glob.glob(search_path)
+    file_paths.sort(key=natural_sort_key)
+
+    if not file_paths:
+        raise FileNotFoundError(f"No files matching '{pattern}' found in '{dir_path}'.")
+
+    print(f"\n[Batch Processor] Discovered {len(file_paths)} VCDC frame(s) in '{dir_path}'.")
+    print("-" * 75)
+    print(f"{'#':<4} {'Filename':<28} {'Mode':<5} {'Payload':<10} {'CRC32':<12} {'FEC Repair'}")
+    print("-" * 75)
+
+    combined_chunks: List[bytes] = []
+    frame_results: List[Dict[str, Any]] = []
+    total_repaired_bytes = 0
+    total_payload_bytes = 0
+    clean_frames = 0
+    repaired_frames = 0
+    failed_frames = 0
+
+    for idx, fpath in enumerate(file_paths, 1):
+        fname = os.path.basename(fpath)
+        try:
+            raw_bytes, meta = decode_image(fpath, backend=backend)
+            combined_chunks.append(raw_bytes)
+            total_payload_bytes += len(raw_bytes)
+            repaired = meta.get('ecc_corrected_count', 0)
+            total_repaired_bytes += repaired
+
+            if repaired > 0:
+                repaired_frames += 1
+                fec_str = f"Repaired {repaired} B"
+            else:
+                clean_frames += 1
+                fec_str = "Clean"
+
+            crc_str = f"{meta['calculated_crc32']} (OK)" if meta.get('checksum_verified') else f"{meta['calculated_crc32']} (ERR)"
+            print(f"{idx:<4} {fname[:27]:<28} {meta['mode']:<5} {len(raw_bytes):<10} {crc_str:<12} {fec_str}")
+
+            frame_results.append({
+                "index": idx,
+                "path": fpath,
+                "filename": fname,
+                "payload_bytes": len(raw_bytes),
+                "crc32": meta['calculated_crc32'],
+                "verified": meta.get('checksum_verified', False),
+                "ecc_corrected_count": repaired,
+                "status": "success"
+            })
+        except Exception as e:
+            failed_frames += 1
+            print(f"{idx:<4} {fname[:27]:<28} ERROR: {str(e)[:30]}")
+            frame_results.append({
+                "index": idx,
+                "path": fpath,
+                "filename": fname,
+                "error": str(e),
+                "status": "failed"
+            })
+
+    print("-" * 75)
+    print(f"Summary: {len(combined_chunks)}/{len(file_paths)} frames decoded successfully.")
+    print(f"Total Combined Payload: {total_payload_bytes} bytes ({total_repaired_bytes} RS errors repaired).")
+
+    # Concatenate chunks with delimiter
+    combined_payload = delimiter.join(combined_chunks)
+
+    if output_path:
+        with open(output_path, 'wb') as out_f:
+            out_f.write(combined_payload)
+        print(f"Exported combined payload to '{output_path}'.")
+
+    return {
+        "directory": dir_path,
+        "total_frames_found": len(file_paths),
+        "successful_frames": len(combined_chunks),
+        "failed_frames": failed_frames,
+        "clean_frames": clean_frames,
+        "repaired_frames": repaired_frames,
+        "total_payload_bytes": total_payload_bytes,
+        "total_repaired_bytes": total_repaired_bytes,
+        "combined_payload": combined_payload,
+        "frame_results": frame_results
+    }
+
+
 def print_cli_help():
     print("""
 Visual Data Codec CLI Usage:
@@ -731,6 +839,9 @@ Encode with FEC:
 Decode with automatic error recovery:
     python visual_codec.py decode -i output.png
     python visual_codec.py decode -i output.png -o restored.dat
+
+Batch Decode multiple frames from a folder/directory:
+    python visual_codec.py batch --dir ./frames -o combined_data.txt [--pattern "*.png"]
 
 Simulate color-shift corruption:
     python visual_codec.py corrupt -i output.png -o corrupted.png [--pixels 5]
@@ -906,6 +1017,39 @@ if __name__ == '__main__':
             sys.exit(1)
         res = downscale_png(in_path, out_path, scale_factor=scale)
         print(f"Downscaled '{in_path}' -> '{out_path}' (Restored: {res['restored_dimensions']} px)")
+
+    elif sys.argv[1] == 'batch':
+        dir_path = None
+        out_path = None
+        pattern = "*.png"
+        delimiter = b""
+        backend = 'auto'
+        i = 2
+        while i < len(sys.argv):
+            arg = sys.argv[i]
+            if arg in ('-d', '--dir', '--directory') and i + 1 < len(sys.argv):
+                dir_path = sys.argv[i + 1]
+                i += 2
+            elif arg in ('-o', '--output') and i + 1 < len(sys.argv):
+                out_path = sys.argv[i + 1]
+                i += 2
+            elif arg in ('-p', '--pattern') and i + 1 < len(sys.argv):
+                pattern = sys.argv[i + 1]
+                i += 2
+            elif arg in ('--delimiter',) and i + 1 < len(sys.argv):
+                delimiter = sys.argv[i + 1].encode('utf-8')
+                i += 2
+            elif arg in ('-b', '--backend') and i + 1 < len(sys.argv):
+                backend = sys.argv[i + 1].upper()
+                i += 2
+            else:
+                i += 1
+
+        if not dir_path:
+            print("Error: Specify --dir <folder_path> [-o combined_output.dat]")
+            sys.exit(1)
+
+        batch_decode_directory(dir_path, output_path=out_path, pattern=pattern, delimiter=delimiter, backend=backend)
 
     else:
         print_cli_help()

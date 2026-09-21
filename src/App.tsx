@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Header, ActiveTab } from './components/Header';
 import { EncoderView } from './components/EncoderView';
 import { DecoderView } from './components/DecoderView';
+import { BatchProcessorView } from './components/BatchProcessorView';
 import { UpscalerView } from './components/UpscalerView';
 import { LiveStreamView } from './components/LiveStreamView';
 import { PythonScriptView } from './components/PythonScriptView';
@@ -19,6 +20,7 @@ export default function App() {
       <main className="flex-1">
         {activeTab === 'encoder' && <EncoderView />}
         {activeTab === 'decoder' && <DecoderView />}
+        {activeTab === 'batch' && <BatchProcessorView />}
         {activeTab === 'upscaler' && <UpscalerView />}
         {activeTab === 'live' && <LiveStreamView />}
         {activeTab === 'python' && <PythonScriptView />}
