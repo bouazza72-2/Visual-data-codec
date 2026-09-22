@@ -1,23 +1,35 @@
 import { CodecHeader, CodecMode, DecodeResult, EncodeResult, PixelInspection } from '../types';
 import { calculateCRC32, formatCRC32Hex } from './crc32';
 import { encodeReedSolomon, decodeReedSolomon } from './reedSolomon';
+import { calculateSha256Bytes, calculateSha256Hex, bytesToHex } from './sha256';
+import { verifyPayloadIntegrity, exportSha256Manifest } from './integrityVerifier';
 
-export const HEADER_BYTE_SIZE = 24;
+export const HEADER_LEGACY_SIZE = 24;
+export const HEADER_EXTENDED_SIZE = 56;
+export const HEADER_BYTE_SIZE = HEADER_EXTENDED_SIZE; // Modern 56-byte header with embedded SHA-256
 export const MAGIC_STRING = 'VCDC';
 export const END_MARKER = 'END\0';
 
 /**
- * Creates the 24-byte header buffer matching the Python struct:
- * >4sBBHQI4s (Magic 4s, ModeID 1B, ECC Parity 1B, ECC BlockSize 2B, uint64 len, uint32 crc, 4-byte end)
+ * Creates the 56-byte header buffer embedding Magic, Mode, ECC, Length, CRC32, and 32-byte SHA-256:
+ * Bytes 0..3:   Magic (VCDC)
+ * Byte 4:       ModeID (1=RGB, 2=Monochrome)
+ * Byte 5:       ECC Parity Symbols
+ * Bytes 6..7:   ECC Block Size N (uint16)
+ * Bytes 8..15:  Payload Length (uint64)
+ * Bytes 16..19: CRC32 Checksum (uint32)
+ * Bytes 20..51: SHA-256 Cryptographic Digest (32 bytes)
+ * Bytes 52..55: End Marker (END\0)
  */
 export function createHeaderBytes(
   payloadLength: number,
   crc32: number,
   mode: CodecMode,
   eccParityBytes: number = 16,
-  eccBlockSize: number = 255
+  eccBlockSize: number = 255,
+  sha256Bytes?: Uint8Array
 ): Uint8Array {
-  const buffer = new ArrayBuffer(HEADER_BYTE_SIZE);
+  const buffer = new ArrayBuffer(HEADER_EXTENDED_SIZE);
   const view = new DataView(buffer);
   const bytes = new Uint8Array(buffer);
 
@@ -30,36 +42,40 @@ export function createHeaderBytes(
   // 2. Mode ID: 1 = RGB, 2 = Monochrome (L)
   bytes[4] = mode === 'RGB' ? 1 : 2;
 
-  // 3. ECC Metadata (formerly 3-byte reserved pad)
-  // Byte 5: Parity symbols per block (e.g. 16 or 32; 0 = no ECC)
+  // 3. ECC Metadata
   bytes[5] = eccParityBytes & 0xff;
-  // Bytes 6..7: Reed-Solomon Block Size N (uint16 big-endian, e.g. 255; 0 = no ECC)
   view.setUint16(6, eccBlockSize, false);
 
-  // 4. Payload Length: 64-bit unsigned big-endian (unencoded payload length)
+  // 4. Payload Length: 64-bit unsigned big-endian
   view.setBigUint64(8, BigInt(payloadLength), false);
 
-  // 5. CRC32 Checksum: 32-bit unsigned big-endian (checksum of original payload)
+  // 5. CRC32 Checksum: 32-bit unsigned big-endian
   view.setUint32(16, crc32 >>> 0, false);
 
-  // 6. End Marker b'END\0'
-  bytes[20] = 0x45; // 'E'
-  bytes[21] = 0x4E; // 'N'
-  bytes[22] = 0x44; // 'D'
-  bytes[23] = 0x00; // '\0'
+  // 6. SHA-256 Digest: 32 raw bytes at offset 20..51
+  if (sha256Bytes && sha256Bytes.length === 32) {
+    bytes.set(sha256Bytes, 20);
+  }
+
+  // 7. End Marker b'END\0' at offset 52..55
+  bytes[52] = 0x45; // 'E'
+  bytes[53] = 0x4E; // 'N'
+  bytes[54] = 0x44; // 'D'
+  bytes[55] = 0x00; // '\0'
 
   return bytes;
 }
 
 /**
- * Parses a 24-byte header buffer.
+ * Parses header buffer, automatically detecting both modern 56-byte headers
+ * (with embedded SHA-256) and legacy 24-byte headers.
  */
 export function parseHeaderBytes(headerBytes: Uint8Array): CodecHeader {
-  if (headerBytes.length < HEADER_BYTE_SIZE) {
-    throw new Error(`Invalid header size (${headerBytes.length} bytes). Minimum required is ${HEADER_BYTE_SIZE} bytes.`);
+  if (headerBytes.length < HEADER_LEGACY_SIZE) {
+    throw new Error(`Invalid header size (${headerBytes.length} bytes). Minimum required is ${HEADER_LEGACY_SIZE} bytes.`);
   }
 
-  const view = new DataView(headerBytes.buffer, headerBytes.byteOffset, HEADER_BYTE_SIZE);
+  const view = new DataView(headerBytes.buffer, headerBytes.byteOffset, headerBytes.byteLength);
 
   // Magic
   const magic = String.fromCharCode(headerBytes[0], headerBytes[1], headerBytes[2], headerBytes[3]);
@@ -87,10 +103,28 @@ export function parseHeaderBytes(headerBytes: Uint8Array): CodecHeader {
   const payloadLength = Number(payloadLengthBig);
   const expectedCrc32 = view.getUint32(16, false) >>> 0;
 
-  // End marker
-  const endMarker = String.fromCharCode(headerBytes[20], headerBytes[21], headerBytes[22], headerBytes[23]);
-  if (endMarker !== END_MARKER) {
-    throw new Error('Header end marker mismatch. The image header may be corrupted.');
+  // Check for 56-byte extended header with SHA-256
+  let hasEmbeddedSha256 = false;
+  let expectedSha256Hex: string | undefined;
+  let endMarker = '';
+
+  if (headerBytes.length >= HEADER_EXTENDED_SIZE) {
+    const endMarker56 = String.fromCharCode(headerBytes[52], headerBytes[53], headerBytes[54], headerBytes[55]);
+    if (endMarker56 === END_MARKER) {
+      hasEmbeddedSha256 = true;
+      endMarker = endMarker56;
+      const shaBytes = headerBytes.subarray(20, 52);
+      expectedSha256Hex = bytesToHex(shaBytes);
+    }
+  }
+
+  // Fallback to legacy 24-byte header
+  if (!hasEmbeddedSha256) {
+    const endMarker24 = String.fromCharCode(headerBytes[20], headerBytes[21], headerBytes[22], headerBytes[23]);
+    if (endMarker24 !== END_MARKER) {
+      throw new Error('Header end marker mismatch. The image header may be corrupted.');
+    }
+    endMarker = endMarker24;
   }
 
   return {
@@ -102,6 +136,8 @@ export function parseHeaderBytes(headerBytes: Uint8Array): CodecHeader {
     payloadLength,
     expectedCrc32,
     expectedCrcHex: formatCRC32Hex(expectedCrc32),
+    expectedSha256Hex,
+    hasEmbeddedSha256,
     endMarker,
   };
 }
@@ -119,6 +155,9 @@ export function encodeBytesToCanvas(
 ): EncodeResult {
   const payloadLen = data.length;
   const crc = calculateCRC32(data);
+  const sha256Bytes = calculateSha256Bytes(data);
+  const sha256Hex = calculateSha256Hex(data);
+  const sha256ManifestText = exportSha256Manifest('encoded_payload.bin', sha256Hex);
 
   // 1. Generate Reed-Solomon ECC parity bytes and append to payload
   const { encoded, totalParityBytes, blockCount } = encodeReedSolomon(
@@ -128,8 +167,8 @@ export function encodeBytesToCanvas(
   );
   const totalEncodedBytes = encoded.length;
 
-  // 2. Build Row-0 Header containing metadata + ECC parameters
-  const headerBytes = createHeaderBytes(payloadLen, crc, mode, eccParityBytes, eccBlockSize);
+  // 2. Build Row-0 Header containing metadata, ECC parameters, and 32-byte SHA-256
+  const headerBytes = createHeaderBytes(payloadLen, crc, mode, eccParityBytes, eccBlockSize, sha256Bytes);
 
   // 3. Calculate grid dimensions dynamically to fit data + ECC parity bytes
   const bytesPerPixel = mode === 'RGB' ? 3 : 1;
@@ -222,6 +261,8 @@ export function encodeBytesToCanvas(
     mode,
     crc32: crc,
     crcHex: formatCRC32Hex(crc),
+    sha256Hex,
+    sha256ManifestText,
     canvas,
     imageDataUrl: canvas.toDataURL('image/png'),
     eccParityBytes,
@@ -372,10 +413,37 @@ export function decodeCanvasToBytes(canvas: HTMLCanvasElement): DecodeResult {
         eccStatus = 'none';
       }
 
-      // Step 4: Final CRC32 validation on the error-corrected payload
+      // Step 4: Final CRC32 and SHA-256 cryptographic validation on the error-corrected payload
       const calculatedCrc32 = calculateCRC32(reconstructedBytes);
       const calculatedCrcHex = formatCRC32Hex(calculatedCrc32);
       const isChecksumValid = calculatedCrc32 === header.expectedCrc32;
+
+      // SHA-256 verification
+      const calculatedSha256Hex = calculateSha256Hex(reconstructedBytes);
+      let isSha256Valid = true;
+      let integrityStatus: 'VERIFIED' | 'CORRUPTED' | 'UNVERIFIED' = 'UNVERIFIED';
+
+      if (header.expectedSha256Hex) {
+        isSha256Valid = calculatedSha256Hex.toLowerCase() === header.expectedSha256Hex.toLowerCase();
+        integrityStatus = isSha256Valid && isChecksumValid ? 'VERIFIED' : 'CORRUPTED';
+      } else {
+        // Legacy header without embedded SHA-256
+        integrityStatus = isChecksumValid ? 'VERIFIED' : 'CORRUPTED';
+      }
+
+      const integrityReport = verifyPayloadIntegrity(
+        reconstructedBytes,
+        `Image (${origW}×${origH} px, ${detectedMode})`,
+        header.expectedCrc32,
+        header.expectedSha256Hex,
+        {
+          parityBytes: eccParityBytes,
+          blockSize: eccBlockSize,
+          correctedCount: eccCorrectedCount,
+          status: eccStatus,
+        }
+      );
+
       const utf8Check = tryDecodeUtf8(reconstructedBytes);
 
       return {
@@ -384,6 +452,10 @@ export function decodeCanvasToBytes(canvas: HTMLCanvasElement): DecodeResult {
         calculatedCrc32,
         calculatedCrcHex,
         isChecksumValid,
+        calculatedSha256Hex,
+        expectedSha256Hex: header.expectedSha256Hex,
+        isSha256Valid,
+        integrityStatus,
         isUtf8Text: utf8Check.valid,
         decodedText: utf8Check.text,
         dimensions: { width: origW, height: origH },
@@ -392,6 +464,7 @@ export function decodeCanvasToBytes(canvas: HTMLCanvasElement): DecodeResult {
         eccErrorPositions,
         eccStatus,
         eccErrorMessage,
+        integrityReport,
       };
     }
   }
@@ -482,7 +555,9 @@ export function getPixelInspection(
       headerField = `Payload Length uint64 [byte ${byteOffset}]`;
     } else if (byteOffset >= 16 && byteOffset < 20) {
       headerField = `CRC32 Checksum uint32 [byte ${byteOffset}]`;
-    } else if (byteOffset >= 20 && byteOffset < 24) {
+    } else if (byteOffset >= 20 && byteOffset < 52) {
+      headerField = `SHA-256 Cryptographic Hash [byte ${byteOffset}]`;
+    } else if (byteOffset >= 52 && byteOffset < 56) {
       headerField = `End Terminator ('END\\0') [byte ${byteOffset}]`;
     } else {
       headerField = 'Row-0 Zero Padding';

@@ -1,6 +1,6 @@
 {
   "name": "Visual Data Codec",
-  "description": "Visual binary and text data encoder, batch processor, and decoder using RGB and monochrome pixel grids with Reed-Solomon FEC and CRC32 verification",
+  "description": "Visual binary and text data encoder, batch processor, decoder, and embedded C header exporter using RGB and monochrome pixel grids with Reed-Solomon FEC and CRC32 verification",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

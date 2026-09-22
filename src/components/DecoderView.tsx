@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import {
   FileDown,
   UploadCloud,
@@ -15,20 +15,99 @@ import {
   Sparkles,
   Cpu,
   AlertTriangle,
+  Key,
 } from 'lucide-react';
 import { DecodeResult } from '../types';
 import { decodeImageFile, decodeCanvasToBytes } from '../utils/codec';
+import { DataIntegrityCard } from './DataIntegrityCard';
+import { KeyValueInspector } from './KeyValueInspector';
+import { parseKeyValueStream, generateSyntheticKeySample } from '../utils/keyValueParser';
+import { calculateCRC32, formatCRC32Hex } from '../utils/crc32';
+import { calculateSha256Hex } from '../utils/sha256';
 
 export const DecoderView: React.FC = () => {
   const [decodeResult, setDecodeResult] = useState<DecodeResult | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
-  const [activeView, setActiveView] = useState<'text' | 'hex'>('text');
+  const [activeView, setActiveView] = useState<'text' | 'hex' | 'keys'>('text');
   const [selectedFileName, setSelectedFileName] = useState<string | null>(null);
   const [noiseStatus, setNoiseStatus] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const loadedCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Automatically scan decoded text for key-value configuration pairs
+  const keyValueParseResult = useMemo(() => {
+    if (!decodeResult || !decodeResult.decodedText) return null;
+    return parseKeyValueStream(decodeResult.decodedText);
+  }, [decodeResult]);
+
+  const handleLoadSyntheticSample = (customSample?: string) => {
+    setErrorMsg(null);
+    setNoiseStatus(null);
+    setSelectedFileName('synthetic_testbed.conf');
+    const sample = customSample || generateSyntheticKeySample();
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(sample);
+    const crc = calculateCRC32(bytes);
+    const crcHex = formatCRC32Hex(crc);
+    const sha = calculateSha256Hex(bytes);
+
+    setDecodeResult({
+      reconstructedBytes: bytes,
+      isUtf8Text: true,
+      decodedText: sample,
+      header: {
+        magic: 'VCDC',
+        modeId: 1,
+        mode: 'RGB',
+        eccParityBytes: 16,
+        eccBlockSize: 255,
+        payloadLength: bytes.length,
+        expectedCrc32: crc,
+        expectedCrcHex: crcHex,
+        expectedSha256Hex: sha,
+        hasEmbeddedSha256: true,
+        endMarker: 'END\0',
+      },
+      dimensions: { width: 120, height: 18 },
+      calculatedCrc32: crc,
+      calculatedCrcHex: crcHex,
+      isChecksumValid: true,
+      calculatedSha256Hex: sha,
+      expectedSha256Hex: sha,
+      isSha256Valid: true,
+      integrityStatus: 'VERIFIED',
+      eccCorrectedCount: 0,
+      eccErrorPositions: [],
+      eccStatus: 'clean',
+      integrityReport: {
+        timestamp: new Date().toISOString(),
+        sourceIdentifier: 'synthetic_testbed.conf',
+        payloadLength: bytes.length,
+        integrityStatus: 'VERIFIED',
+        crc32: {
+          expected: crcHex,
+          calculated: crcHex,
+          matches: true,
+        },
+        sha256: {
+          expected: sha,
+          calculated: sha,
+          matches: true,
+        },
+        eccSummary: {
+          parityBytes: 16,
+          blockSize: 255,
+          correctedCount: 0,
+          status: 'clean',
+        },
+        sectors: [],
+        summaryText: 'Bit-exact match verified with standard SHA-256 and CRC32 parity check.',
+      },
+    });
+    setActiveView('keys');
+  };
 
   const processFile = async (file: File) => {
     setErrorMsg(null);
@@ -56,7 +135,12 @@ export const DecoderView: React.FC = () => {
             try {
               const result = decodeCanvasToBytes(canvas);
               setDecodeResult(result);
-              setActiveView(result.isUtf8Text ? 'text' : 'hex');
+              const parsed = result.decodedText ? parseKeyValueStream(result.decodedText) : null;
+              if (parsed && parsed.hasEntries) {
+                setActiveView('keys');
+              } else {
+                setActiveView(result.isUtf8Text ? 'text' : 'hex');
+              }
               resolve();
             } catch (e) {
               reject(e);
@@ -226,6 +310,19 @@ export const DecoderView: React.FC = () => {
             <p className="text-xs text-stone-500 mt-1">
               Validates 24-byte Row-0 header magic (<code>VCDC</code>), checks mode, and computes CRC32
             </p>
+            <div className="mt-3 pt-3 border-t border-stone-200/60 flex items-center justify-center gap-2">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleLoadSyntheticSample();
+                }}
+                className="inline-flex items-center gap-1.5 text-xs text-amber-800 bg-amber-50 hover:bg-amber-100 px-3 py-1 rounded-lg border border-amber-200 font-semibold transition-all shadow-2xs"
+              >
+                <Key className="w-3.5 h-3.5 text-amber-600" />
+                <span>Test with Academic Synthetic Key-Value Sample</span>
+              </button>
+            </div>
           </div>
 
           {errorMsg && (
@@ -242,7 +339,21 @@ export const DecoderView: React.FC = () => {
         {decodeResult && (
           <div className="bg-white rounded-2xl border border-stone-200 p-6 shadow-xs space-y-6">
             
-            {/* Header / Checksum Verification Status Banner */}
+            {/* Real-Time SHA-256 and CRC32 Data Integrity Card */}
+            <DataIntegrityCard
+              report={decodeResult.integrityReport}
+              expectedSha256={decodeResult.expectedSha256Hex}
+              calculatedSha256={decodeResult.calculatedSha256Hex}
+              expectedCrc32Hex={decodeResult.header.expectedCrcHex}
+              calculatedCrc32Hex={decodeResult.calculatedCrcHex}
+              isChecksumValid={decodeResult.isChecksumValid}
+              isSha256Valid={decodeResult.isSha256Valid}
+              totalBytes={decodeResult.reconstructedBytes.length}
+              fileName={selectedFileName ? selectedFileName.replace(/\.[^/.]+$/, '.bin') : 'decoded_payload.bin'}
+              sourceContext="file_decoder"
+            />
+
+            {/* Quick Action & Checksum Status Banner */}
             <div
               className={`p-4 rounded-xl border flex flex-wrap items-center justify-between gap-3 ${
                 decodeResult.isChecksumValid
@@ -388,10 +499,35 @@ export const DecoderView: React.FC = () => {
               </div>
             )}
 
+            {/* Extracted Configuration & Keys Inspector (Auto-detected) */}
+            {keyValueParseResult && keyValueParseResult.hasEntries && (
+              <KeyValueInspector
+                parseResult={keyValueParseResult}
+                onLoadSynthetic={handleLoadSyntheticSample}
+                title="Extracted Configuration & Cryptographic Keys"
+                sourceContext="decoder"
+              />
+            )}
+
             {/* Reconstructed Data Content View */}
             <div className="border border-stone-200 rounded-xl overflow-hidden">
               <div className="bg-stone-50 px-4 py-2.5 border-b border-stone-200 flex items-center justify-between">
                 <div className="flex items-center gap-2">
+                  {keyValueParseResult && keyValueParseResult.hasEntries && (
+                    <button
+                      id="tab-keys-view"
+                      onClick={() => setActiveView('keys')}
+                      className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium transition-all ${
+                        activeView === 'keys'
+                          ? 'bg-amber-100 text-amber-900 shadow-xs border border-amber-300 font-semibold'
+                          : 'text-amber-800 hover:text-amber-950 bg-amber-50/60 border border-amber-200/60'
+                      }`}
+                    >
+                      <Key className="w-3.5 h-3.5 text-amber-600" />
+                      <span>Keys &amp; Config ({keyValueParseResult.totalKeys})</span>
+                    </button>
+                  )}
+
                   {decodeResult.isUtf8Text && (
                     <button
                       onClick={() => setActiveView('text')}
@@ -440,7 +576,11 @@ export const DecoderView: React.FC = () => {
               </div>
 
               <div className="p-4 bg-stone-900 text-stone-100 font-mono text-xs overflow-auto max-h-96">
-                {activeView === 'text' && decodeResult.decodedText ? (
+                {activeView === 'keys' && decodeResult.decodedText ? (
+                  <pre className="whitespace-pre-wrap font-mono text-amber-300/90 leading-relaxed">
+                    {decodeResult.decodedText}
+                  </pre>
+                ) : activeView === 'text' && decodeResult.decodedText ? (
                   <pre className="whitespace-pre-wrap font-mono text-emerald-400 leading-relaxed">
                     {decodeResult.decodedText}
                   </pre>

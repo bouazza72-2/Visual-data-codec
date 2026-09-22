@@ -11,6 +11,7 @@ import {
   Maximize2,
   ShieldCheck,
   Layers,
+  Key,
 } from 'lucide-react';
 
 const UPSCALE_PNG_CODE = `#!/usr/bin/env python3
@@ -493,13 +494,97 @@ def decode_image(image_path: str, backend: str = 'PIL') -> Tuple[bytes, Dict[str
     }
 `;
 
+const KEY_PARSER_CODE = `#!/usr/bin/env python3
+"""
+Educational Key-Value & Cryptographic Metadata Parser (key_parser.py)
+=====================================================================
+Part of the Visual Data Codec (VCDC) Academic Research Suite.
+Designed for university coursework, optical data transmission experiments,
+and synthetic testbed verification.
+
+Features:
+- Zero External Dependencies: Standard Python 3 (re, hashlib, argparse, binascii).
+- Pattern Detection: Extracts key-value pairs (key = value, key: value, INI sections).
+- Bit/Byte Length Validation: Classifies 128-bit (AES-128), 192-bit, 256-bit (AES-256/HMAC), 512-bit.
+- SHA-256 Digest Verification: Validates extracted hex tokens against expected cryptographic digests.
+- Privacy Masking: Masks sensitive hex characters by default with unmask flags.
+- Built-in Synthetic Testbed: Self-tests using dummy test vectors without any external inputs.
+
+Usage:
+  # Run self-test on synthetic test vectors:
+  python3 key_parser.py --test
+
+  # Parse decoded visual payload file:
+  python3 key_parser.py restored_stream.txt
+
+  # Pipe directly from live optical decoder:
+  python3 live_stream_decoder.py --headless | python3 key_parser.py --stdin
+
+  # Export to standardized .conf or .keys:
+  python3 key_parser.py restored_stream.txt --format conf -o output.conf
+"""
+
+import sys
+import os
+import re
+import hashlib
+import binascii
+import argparse
+from typing import List, Dict, Any, Optional
+
+SYNTHETIC_SAMPLE = """# ====================================================================
+# Synthetic Cryptographic Testbed Configuration (Academic Sample)
+# Visual Data Codec - Optical Data Transmission Test
+# ====================================================================
+
+[system_metadata]
+experiment_id = exp_2026_visual_vcdc_01
+author = Academic Research Testbed
+protocol_version = 2.0
+
+[symmetric_ciphers]
+# Standard 128-bit AES Test Vectors (16 bytes / 32 hex chars)
+aes_128_key_00 = 2b7e151628aed2a6abf7158809cf4f3c
+aes_128_iv_00 = 000102030405060708090a0b0c0d0e0f
+aes_128_key_01 = 00112233445566778899aabbccddeeff
+
+# Standard 256-bit AES / HMAC Test Vectors (32 bytes / 64 hex chars)
+master_key_00 = 603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4
+master_key_01 = f58c4c04d6e5f1ba779eabfb5f7bf462749424bcf969eed3ec59fe781bc17d2f
+hmac_sha256_secret = 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+
+[session_tokens]
+session_token_128 = 4a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d
+auth_challenge_nonce = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+"""
+
+# (Full script available in /key_parser.py and /public/key_parser.py)
+`;
+
 export const PythonScriptView: React.FC = () => {
-  const [selectedScript, setSelectedScript] = useState<'upscaler' | 'codec'>('upscaler');
+  const [selectedScript, setSelectedScript] = useState<'upscaler' | 'codec' | 'key_parser'>('upscaler');
   const [copied, setCopied] = useState<boolean>(false);
 
-  const activeCode = selectedScript === 'upscaler' ? UPSCALE_PNG_CODE : VISUAL_CODEC_CODE;
-  const activeFilename = selectedScript === 'upscaler' ? 'upscale_png.py' : 'visual_codec.py';
-  const downloadUrl = selectedScript === 'upscaler' ? '/upscale_png.py' : '/visual_codec.py';
+  const activeCode =
+    selectedScript === 'upscaler'
+      ? UPSCALE_PNG_CODE
+      : selectedScript === 'codec'
+      ? VISUAL_CODEC_CODE
+      : KEY_PARSER_CODE;
+
+  const activeFilename =
+    selectedScript === 'upscaler'
+      ? 'upscale_png.py'
+      : selectedScript === 'codec'
+      ? 'visual_codec.py'
+      : 'key_parser.py';
+
+  const downloadUrl =
+    selectedScript === 'upscaler'
+      ? '/upscale_png.py'
+      : selectedScript === 'codec'
+      ? '/visual_codec.py'
+      : '/key_parser.py';
 
   const handleCopyCode = () => {
     navigator.clipboard.writeText(activeCode);
@@ -576,6 +661,19 @@ export const PythonScriptView: React.FC = () => {
           <Layers className="w-3.5 h-3.5 text-amber-400" />
           <span>visual_codec.py (Complete Codec + CRC32 Header)</span>
         </button>
+
+        <button
+          id="tab-script-key-parser"
+          onClick={() => setSelectedScript('key_parser')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold transition-all ${
+            selectedScript === 'key_parser'
+              ? 'bg-stone-900 text-white shadow-xs'
+              : 'bg-white text-stone-600 hover:text-stone-900 border border-stone-200'
+          }`}
+        >
+          <Key className="w-3.5 h-3.5 text-blue-400" />
+          <span>key_parser.py (Academic Cryptographic &amp; Key-Value Parser)</span>
+        </button>
       </div>
 
       {/* Quick Documentation Cards */}
@@ -611,7 +709,7 @@ export const PythonScriptView: React.FC = () => {
             </p>
           </div>
         </div>
-      ) : (
+      ) : selectedScript === 'codec' ? (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="p-4 bg-white rounded-xl border border-stone-200 shadow-2xs space-y-1">
             <span className="text-xs font-bold text-stone-900 flex items-center gap-1.5">
@@ -640,6 +738,38 @@ export const PythonScriptView: React.FC = () => {
             </span>
             <p className="text-[11px] text-stone-500">
               Includes <code>upscale</code>, <code>encode</code>, <code>decode</code>, and <code>demo</code> CLI subcommands.
+            </p>
+          </div>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="p-4 bg-white rounded-xl border border-stone-200 shadow-2xs space-y-1">
+            <span className="text-xs font-bold text-stone-900 flex items-center gap-1.5">
+              <Terminal className="w-3.5 h-3.5 text-blue-600" />
+              Zero Dependencies (Python 3 Stdlib)
+            </span>
+            <p className="text-[11px] text-stone-500">
+              Uses built-in <code>re</code>, <code>hashlib</code>, and <code>argparse</code>. Runs anywhere without pip installs.
+            </p>
+          </div>
+
+          <div className="p-4 bg-white rounded-xl border border-stone-200 shadow-2xs space-y-1">
+            <span className="text-xs font-bold text-stone-900 flex items-center gap-1.5">
+              <Key className="w-3.5 h-3.5 text-amber-600" />
+              128b / 256b / 512b Validation
+            </span>
+            <p className="text-[11px] text-stone-500">
+              Validates bit-lengths, confirms pure hex characters, and checks against SHA-256 digests.
+            </p>
+          </div>
+
+          <div className="p-4 bg-white rounded-xl border border-stone-200 shadow-2xs space-y-1">
+            <span className="text-xs font-bold text-stone-900 flex items-center gap-1.5">
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+              Offline Self-Test Mode (--test)
+            </span>
+            <p className="text-[11px] text-stone-500">
+              Includes synthetic academic test vectors for verification without live inputs.
             </p>
           </div>
         </div>

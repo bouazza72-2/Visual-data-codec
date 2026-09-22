@@ -5,6 +5,7 @@ import { CodecMode } from '../types';
 interface HeaderInspectorProps {
   payloadLength: number;
   crcHex: string;
+  sha256Hex?: string;
   mode: CodecMode;
   width: number;
   height: number;
@@ -15,6 +16,7 @@ interface HeaderInspectorProps {
 export const HeaderInspector: React.FC<HeaderInspectorProps> = ({
   payloadLength,
   crcHex,
+  sha256Hex,
   mode,
   width,
   height,
@@ -23,8 +25,8 @@ export const HeaderInspector: React.FC<HeaderInspectorProps> = ({
 }) => {
   const modeId = mode === 'RGB' ? 1 : 2;
   const pixelsInRow0 = width;
-  const headerPixels = mode === 'RGB' ? 8 : 24;
-  const paddingPixels = pixelsInRow0 - headerPixels;
+  const headerPixels = mode === 'RGB' ? Math.ceil(56 / 3) : 56;
+  const paddingPixels = Math.max(0, pixelsInRow0 - headerPixels);
 
   return (
     <div className="bg-white rounded-xl border border-stone-200 p-4 shadow-xs">
@@ -32,7 +34,7 @@ export const HeaderInspector: React.FC<HeaderInspectorProps> = ({
         <div className="flex items-center gap-2">
           <ShieldCheck className="w-4 h-4 text-emerald-600" />
           <h3 className="text-sm font-semibold text-stone-800">
-            Row 0 Metadata Header (24 Bytes)
+            Row 0 Metadata Header (56 Bytes V2 with SHA-256)
           </h3>
         </div>
         <div className="flex items-center gap-2">
@@ -52,10 +54,10 @@ export const HeaderInspector: React.FC<HeaderInspectorProps> = ({
       </div>
 
       <p className="text-xs text-stone-500 mb-3">
-        Row 0 is reserved exclusively for the 24-byte binary metadata header. Data payload starts on Row 1 (y = 1).
+        Row 0 is reserved exclusively for the 56-byte binary metadata header with CRC32 + 32-byte SHA-256 hash. Data payload starts on Row 1 (y = 1).
       </p>
 
-      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs font-mono">
+      <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 text-xs font-mono">
         <div className="p-2.5 rounded-lg bg-stone-50 border border-stone-200">
           <div className="text-stone-400 text-[10px] uppercase font-sans mb-1 flex items-center gap-1">
             <Info className="w-3 h-3 text-stone-400" />
@@ -90,7 +92,7 @@ export const HeaderInspector: React.FC<HeaderInspectorProps> = ({
         <div className="p-2.5 rounded-lg bg-stone-50 border border-stone-200">
           <div className="text-stone-400 text-[10px] uppercase font-sans mb-1 flex items-center gap-1">
             <Hash className="w-3 h-3 text-stone-400" />
-            8-15 • Payload Size
+            8-15 • Size
           </div>
           <div className="text-stone-900 font-bold">
             {payloadLength.toLocaleString()} B
@@ -104,7 +106,18 @@ export const HeaderInspector: React.FC<HeaderInspectorProps> = ({
             16-19 • CRC32
           </div>
           <div className="font-bold font-mono tracking-wide text-[11px] truncate">{crcHex}</div>
-          <div className="text-emerald-700 text-[10px] mt-0.5">20-23: END\0</div>
+          <div className="text-emerald-700 text-[10px] mt-0.5">IEEE 802.3</div>
+        </div>
+
+        <div className="p-2.5 rounded-lg bg-emerald-950 text-emerald-300 border border-emerald-800">
+          <div className="text-emerald-400 text-[10px] uppercase font-sans mb-1 flex items-center gap-1">
+            <ShieldCheck className="w-3 h-3 text-emerald-400" />
+            20-51 • SHA-256
+          </div>
+          <div className="font-bold font-mono tracking-wider text-[10px] truncate" title={sha256Hex || 'SHA-256 Digest'}>
+            {sha256Hex ? `${sha256Hex.slice(0, 8)}...${sha256Hex.slice(-6)}` : '256-bit Digest'}
+          </div>
+          <div className="text-emerald-400 text-[10px] mt-0.5">52-55: END\0</div>
         </div>
       </div>
 

@@ -10,11 +10,15 @@ import {
   Copy,
   Check,
   ShieldCheck,
+  FileCheck,
+  Code2,
+  Cpu,
 } from 'lucide-react';
 import { CodecMode, EncodeResult } from '../types';
 import { encodeBytesToCanvas } from '../utils/codec';
 import { HeaderInspector } from './HeaderInspector';
 import { PixelMagnifier } from './PixelMagnifier';
+import { CHeaderExportModal } from './CHeaderExportModal';
 
 const PRESETS = [
   {
@@ -66,6 +70,7 @@ export const EncoderView: React.FC = () => {
   const [eccParityBytes, setEccParityBytes] = useState<number>(16);
   const [encodeResult, setEncodeResult] = useState<EncodeResult | null>(null);
   const [copied, setCopied] = useState<boolean>(false);
+  const [isCHeaderModalOpen, setIsCHeaderModalOpen] = useState<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Derive current binary bytes to encode
@@ -140,6 +145,29 @@ export const EncoderView: React.FC = () => {
     navigator.clipboard.writeText(encodeResult.crcHex);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleCopySha = () => {
+    if (!encodeResult?.sha256Hex) return;
+    navigator.clipboard.writeText(encodeResult.sha256Hex);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleDownloadSha256Manifest = () => {
+    if (!encodeResult?.sha256Hex) return;
+    const baseName =
+      inputTab === 'file' && uploadedFile
+        ? uploadedFile.name
+        : 'encoded_payload.bin';
+    const manifestContent = `${encodeResult.sha256Hex.toLowerCase()}  ${baseName}\n`;
+    const blob = new Blob([manifestContent], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}.sha256`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -383,6 +411,7 @@ export const EncoderView: React.FC = () => {
             <HeaderInspector
               payloadLength={encodeResult.payloadBytes}
               crcHex={encodeResult.crcHex}
+              sha256Hex={encodeResult.sha256Hex}
               mode={encodeResult.mode}
               width={encodeResult.width}
               height={encodeResult.height}
@@ -401,7 +430,27 @@ export const EncoderView: React.FC = () => {
               </h2>
 
               {encodeResult && (
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    id="btn-export-c-header"
+                    onClick={() => setIsCHeaderModalOpen(true)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-800 rounded-xl text-xs font-semibold transition-all border border-blue-300 shadow-2xs"
+                    title="Export visual payload as a ready-to-use C/C++ header buffer for embedded systems"
+                  >
+                    <Code2 className="w-3.5 h-3.5 text-blue-600" />
+                    <span>Export C Header (.h)</span>
+                  </button>
+
+                  <button
+                    id="btn-download-manifest"
+                    onClick={handleDownloadSha256Manifest}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded-xl text-xs font-medium transition-all border border-emerald-300 shadow-2xs"
+                    title="Export sidecar .sha256 checksum manifest"
+                  >
+                    <FileCheck className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>.sha256 Manifest</span>
+                  </button>
+
                   <button
                     id="btn-download-png"
                     onClick={handleDownloadPNG}
@@ -459,19 +508,19 @@ export const EncoderView: React.FC = () => {
 
                   <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900">
                     <div className="flex items-center justify-between">
-                      <span className="text-emerald-700 text-[10px] uppercase">CRC32 Checksum</span>
+                      <span className="text-emerald-700 text-[10px] uppercase font-bold">SHA-256 + CRC32</span>
                       <button
-                        onClick={handleCopyHex}
+                        onClick={handleCopySha}
                         className="text-emerald-700 hover:text-emerald-900"
-                        title="Copy Checksum"
+                        title="Copy SHA-256 Digest"
                       >
                         {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
                       </button>
                     </div>
-                    <span className="font-mono font-bold text-xs block truncate mt-0.5">
-                      {encodeResult.crcHex}
+                    <span className="font-mono font-bold text-xs block truncate mt-0.5" title={encodeResult.sha256Hex}>
+                      {encodeResult.sha256Hex.slice(0, 10)}...
                     </span>
-                    <span className="text-emerald-600 text-[10px] block">Standard IEEE 802.3</span>
+                    <span className="text-emerald-700 font-mono text-[10px] block">CRC: {encodeResult.crcHex}</span>
                   </div>
                 </div>
 
@@ -489,8 +538,34 @@ export const EncoderView: React.FC = () => {
                     />
                   </div>
                   <div className="text-[11px] text-stone-400 mt-2">
-                    Row 0 (top line) = 24-byte Header • Rows 1..{encodeResult.height - 1} = Encoded Data
+                    Row 0 (top line) = 56-byte V2 Header (SHA-256 + CRC32) • Rows 1..{encodeResult.height - 1} = Encoded Data
                   </div>
+                </div>
+
+                {/* Embedded Systems C Header Buffer Export Banner */}
+                <div className="p-4 rounded-xl bg-blue-50/70 border border-blue-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-blue-950">
+                  <div className="flex items-start gap-3">
+                    <div className="w-8 h-8 rounded-lg bg-blue-100 border border-blue-200 text-blue-700 flex items-center justify-center shrink-0">
+                      <Cpu className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="font-semibold text-blue-900 flex items-center gap-1.5">
+                        <span>Embedded Systems & HDMI Transmitters</span>
+                        <span className="text-[10px] font-mono bg-blue-100 text-blue-800 px-1.5 py-0.5 rounded font-medium">C99/C++</span>
+                      </div>
+                      <p className="text-[11px] text-blue-800/80 mt-0.5">
+                        Export this exact visual payload as a ready-to-use C header array (<code className="font-mono font-semibold">.h</code>) for STM32, ESP32, Arduino, or <code className="font-mono font-semibold">visual_tx.h</code>.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    id="btn-open-c-header-modal"
+                    onClick={() => setIsCHeaderModalOpen(true)}
+                    className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold shadow-xs transition-all shrink-0 text-xs"
+                  >
+                    <Code2 className="w-3.5 h-3.5" />
+                    <span>Generate C Header</span>
+                  </button>
                 </div>
               </div>
             ) : (
@@ -511,6 +586,17 @@ export const EncoderView: React.FC = () => {
         </div>
 
       </div>
+
+      {/* Embedded C Header Export Modal */}
+      {encodeResult && (
+        <CHeaderExportModal
+          isOpen={isCHeaderModalOpen}
+          onClose={() => setIsCHeaderModalOpen(false)}
+          encodeResult={encodeResult}
+          sourceFilename={inputTab === 'file' && uploadedFile ? uploadedFile.name : 'vcdc_payload.bin'}
+          rawPayloadBytes={currentBytes}
+        />
+      )}
     </div>
   );
 };

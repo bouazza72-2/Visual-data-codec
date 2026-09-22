@@ -26,6 +26,7 @@ import glob
 import math
 import zlib
 import struct
+import hashlib
 import random
 from typing import Tuple, Dict, Any, Optional, List
 
@@ -48,7 +49,7 @@ except ImportError:
 # ==============================================================================
 # HEADER SPECIFICATION CONSTANTS
 # ==============================================================================
-# Header format (24 bytes total, big-endian):
+# Header format v2 (56 bytes total, big-endian):
 # Offset | Size | Type      | Description
 # -------+------+-----------+----------------------------------------------
 # 0      | 4    | 4s (char) | Magic bytes: b'VCDC' (Visual Codec)
@@ -57,11 +58,17 @@ except ImportError:
 # 6      | 2    | H (uint16)| ECC Block Size N (e.g. 255; 0 = no ECC)
 # 8      | 8    | Q (uint64)| Original unencoded payload byte length
 # 16     | 4    | I (uint32)| CRC32 checksum of original unencoded payload
-# 20     | 4    | 4s (char) | End marker: b'END\\x00'
+# 20     | 32   | 32s (raw) | SHA-256 cryptographic digest of unencoded payload
+# 52     | 4    | 4s (char) | End marker: b'END\x00'
 HEADER_MAGIC = b'VCDC'
 HEADER_END = b'END\x00'
-HEADER_STRUCT_FORMAT = '>4sBBHQI4s'
-HEADER_BYTE_SIZE = struct.calcsize(HEADER_STRUCT_FORMAT)  # Exactly 24 bytes
+
+HEADER_STRUCT_FORMAT_V1 = '>4sBBHQI4s'
+HEADER_BYTE_SIZE_V1 = struct.calcsize(HEADER_STRUCT_FORMAT_V1)  # 24 bytes
+
+HEADER_STRUCT_FORMAT_V2 = '>4sBBHQI32s4s'
+HEADER_BYTE_SIZE_V2 = struct.calcsize(HEADER_STRUCT_FORMAT_V2)  # 56 bytes
+HEADER_BYTE_SIZE = HEADER_BYTE_SIZE_V2
 
 MODE_RGB = 'RGB'
 MODE_MONO = 'L'  # Grayscale / Monochrome
@@ -138,21 +145,24 @@ def create_header(
     crc32: int,
     mode: str,
     ecc_parity: int = DEFAULT_ECC_PARITY_BYTES,
-    ecc_block_size: int = DEFAULT_ECC_BLOCK_SIZE
+    ecc_block_size: int = DEFAULT_ECC_BLOCK_SIZE,
+    sha256_bytes: Optional[bytes] = None
 ) -> bytes:
-    """Pack metadata into a strict 24-byte binary header with ECC parameters."""
+    """Pack metadata into a strict 56-byte binary header with ECC parameters and 32-byte SHA-256."""
     mode_id = MODE_IDS.get(mode.upper())
     if mode_id is None:
         raise ValueError(f"Unsupported mode '{mode}'. Choose 'RGB' or 'L' (monochrome).")
 
+    raw_sha = sha256_bytes if (sha256_bytes and len(sha256_bytes) == 32) else (b'\x00' * 32)
     return struct.pack(
-        HEADER_STRUCT_FORMAT,
+        HEADER_STRUCT_FORMAT_V2,
         HEADER_MAGIC,
         mode_id,
         ecc_parity & 0xFF,
         ecc_block_size & 0xFFFF,
         payload_len,
         crc32 & 0xFFFFFFFF,
+        raw_sha,
         HEADER_END
     )
 
@@ -182,13 +192,15 @@ def encode_bytes_to_grid(
     payload_len = len(data)
     # CRC32 of original unencoded payload
     crc = zlib.crc32(data) & 0xFFFFFFFF
+    # Cryptographic SHA-256 of original unencoded payload
+    sha_bytes = hashlib.sha256(data).digest()
 
     # 1. Reed-Solomon encoding: append error correction parity bytes
     encoded_data, total_parity, block_count = rs_encode_payload(data, ecc_parity, ecc_block_size)
     total_encoded_bytes = len(encoded_data)
 
-    # 2. Build 24-byte Row-0 Header with ECC parameters
-    header_bytes = create_header(payload_len, crc, mode, ecc_parity, ecc_block_size)
+    # 2. Build 56-byte Row-0 Header with ECC parameters and SHA-256
+    header_bytes = create_header(payload_len, crc, mode, ecc_parity, ecc_block_size, sha_bytes)
 
     # 3. Dynamic grid sizing: ensure grid accommodates payload + parity bytes
     bytes_per_pixel = 3 if mode == MODE_RGB else 1
@@ -278,7 +290,8 @@ def encode_data(
     backend: str = 'PIL',
     min_width: int = 64,
     ecc_parity: int = DEFAULT_ECC_PARITY_BYTES,
-    ecc_block_size: int = DEFAULT_ECC_BLOCK_SIZE
+    ecc_block_size: int = DEFAULT_ECC_BLOCK_SIZE,
+    export_sha256_manifest: bool = True
 ) -> Dict[str, Any]:
     """High-level encoder: Encodes text string or binary bytes into a lossless PNG with RS FEC."""
     if isinstance(input_data, str):
@@ -299,6 +312,14 @@ def encode_data(
 
     height, width = grid.shape[:2]
     crc = zlib.crc32(raw_bytes) & 0xFFFFFFFF
+    sha256_hex = hashlib.sha256(raw_bytes).hexdigest()
+
+    # Generate sidecar .sha256 manifest file if requested
+    manifest_path = None
+    if export_sha256_manifest:
+        manifest_path = f"{output_png_path}.sha256"
+        with open(manifest_path, "w", encoding="utf-8") as mf:
+            mf.write(f"{sha256_hex}  {os.path.basename(output_png_path)}\n")
 
     k = ecc_block_size - ecc_parity if ecc_parity > 0 else len(raw_bytes)
     block_count = math.ceil(len(raw_bytes) / k) if (ecc_parity > 0 and len(raw_bytes) > 0) else 1
@@ -312,6 +333,8 @@ def encode_data(
         "total_pixels": width * height,
         "payload_bytes": len(raw_bytes),
         "crc32": f"0x{crc:08X}",
+        "sha256": sha256_hex,
+        "manifest_path": manifest_path,
         "ecc_parity_bytes": ecc_parity,
         "ecc_block_size": ecc_block_size,
         "total_parity_bytes": total_parity,
@@ -325,12 +348,20 @@ def encode_file(
     output_png_path: str,
     mode: str = MODE_RGB,
     backend: str = 'PIL',
-    ecc_parity: int = DEFAULT_ECC_PARITY_BYTES
+    ecc_parity: int = DEFAULT_ECC_PARITY_BYTES,
+    export_sha256_manifest: bool = True
 ) -> Dict[str, Any]:
     """Read a binary/text file from disk and encode it into a lossless PNG."""
     with open(input_file_path, 'rb') as f:
         file_bytes = f.read()
-    return encode_data(file_bytes, output_png_path, mode=mode, backend=backend, ecc_parity=ecc_parity)
+    return encode_data(
+        file_bytes,
+        output_png_path,
+        mode=mode,
+        backend=backend,
+        ecc_parity=ecc_parity,
+        export_sha256_manifest=export_sha256_manifest
+    )
 
 
 # ==============================================================================
@@ -384,23 +415,36 @@ def decode_grid_to_bytes(grid: np.ndarray) -> Tuple[bytes, Dict[str, Any]]:
     else:
         raise ValueError(f"Invalid grid dimensions {grid.shape}. Expected 2D or 3D array.")
 
-    if len(row0_bytes) < HEADER_BYTE_SIZE:
-        raise ValueError(f"Image width ({grid.shape[1]}) is too small to contain the {HEADER_BYTE_SIZE}-byte header.")
+    if len(row0_bytes) < HEADER_BYTE_SIZE_V1:
+        raise ValueError(f"Image width ({grid.shape[1]}) is too small to contain the {HEADER_BYTE_SIZE_V1}-byte header.")
 
-    # 1. Unpack Header with ECC Parameters
-    try:
-        magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, end_marker = struct.unpack(
-            HEADER_STRUCT_FORMAT,
-            row0_bytes[:HEADER_BYTE_SIZE]
-        )
-    except Exception as e:
-        raise ValueError(f"Failed to unpack header bytes: {e}")
+    # 1. Unpack Header with ECC Parameters (Detect v2 56-byte or v1 24-byte header)
+    has_sha256 = False
+    expected_sha256 = None
+
+    if len(row0_bytes) >= HEADER_BYTE_SIZE_V2 and row0_bytes[52:56] == HEADER_END:
+        try:
+            magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, raw_sha, end_marker = struct.unpack(
+                HEADER_STRUCT_FORMAT_V2,
+                row0_bytes[:HEADER_BYTE_SIZE_V2]
+            )
+            has_sha256 = True
+            expected_sha256 = raw_sha.hex().lower()
+        except Exception as e:
+            raise ValueError(f"Failed to unpack 56-byte header: {e}")
+    elif len(row0_bytes) >= HEADER_BYTE_SIZE_V1 and row0_bytes[20:24] == HEADER_END:
+        try:
+            magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, end_marker = struct.unpack(
+                HEADER_STRUCT_FORMAT_V1,
+                row0_bytes[:HEADER_BYTE_SIZE_V1]
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to unpack 24-byte legacy header: {e}")
+    else:
+        raise ValueError("Header end marker mismatch! Image header might be corrupted or unrecognized.")
 
     if magic != HEADER_MAGIC:
         raise ValueError(f"Header magic mismatch! Expected '{HEADER_MAGIC.decode()}', found '{magic}'. Not a valid Visual Codec image.")
-
-    if end_marker != HEADER_END:
-        raise ValueError("Header end marker mismatch! Image header might be corrupted.")
 
     mode = ID_TO_MODE.get(mode_id)
     if mode is None:
@@ -457,12 +501,32 @@ def decode_grid_to_bytes(grid: np.ndarray) -> Tuple[bytes, Dict[str, Any]]:
             f"The image data has uncorrectable corruptions or color shifts exceeding FEC capacity."
         )
 
+    # 5. Cryptographic SHA-256 Validation
+    calculated_sha256 = hashlib.sha256(corrected_bytes).hexdigest()
+    sha256_verified = True
+    if has_sha256 and expected_sha256:
+        if calculated_sha256.lower() != expected_sha256.lower():
+            raise ValueError(
+                f"SHA-256 Cryptographic Hash Mismatch!\n"
+                f"  Expected:   {expected_sha256}\n"
+                f"  Calculated: {calculated_sha256}\n"
+                f"Data integrity compromised."
+            )
+        sha256_verified = True
+    else:
+        sha256_verified = False  # Legacy header without embedded SHA-256
+
     metadata = {
         "mode": mode,
         "payload_bytes": payload_len,
         "expected_crc32": f"0x{expected_crc:08X}",
         "calculated_crc32": f"0x{calculated_crc:08X}",
         "checksum_verified": True,
+        "has_sha256": has_sha256,
+        "expected_sha256": expected_sha256,
+        "calculated_sha256": calculated_sha256,
+        "sha256_verified": sha256_verified,
+        "integrity_status": "VERIFIED" if (sha256_verified or not has_sha256) and calculated_crc == expected_crc else "CORRUPTED",
         "dimensions": (grid.shape[1], grid.shape[0]),
         "ecc_parity_bytes": ecc_parity,
         "ecc_block_size": ecc_block_size,

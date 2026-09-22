@@ -47,12 +47,22 @@ import os
 import time
 import math
 import zlib
+import hashlib
 import struct
 import argparse
 from collections import deque
 from typing import Tuple, Dict, Any, Optional, List
 
-import numpy as np
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    class _DummyNumpy:
+        ndarray = Any
+        uint8 = int
+    np = _DummyNumpy()
+    NUMPY_AVAILABLE = False
+    print("[ERROR] numpy is required. Install via: pip install numpy opencv-python pillow reedsolo", file=sys.stderr)
 
 # Optional imports with friendly error reporting
 try:
@@ -76,14 +86,33 @@ try:
 except ImportError:
     HAS_LOCAL_CODEC = False
 
+# Import integrity verification module if available
+try:
+    import integrity_verifier
+    from integrity_verifier import StreamIntegrityVerifier
+    HAS_VERIFIER_MODULE = True
+except ImportError:
+    HAS_VERIFIER_MODULE = False
+
 
 # ==============================================================================
 # HEADER SPECIFICATION CONSTANTS
 # ==============================================================================
 HEADER_MAGIC = b'VCDC'
 HEADER_END = b'END\x00'
-HEADER_STRUCT_FORMAT = '>4sBBHQI4s'
-HEADER_BYTE_SIZE = struct.calcsize(HEADER_STRUCT_FORMAT)  # Exactly 24 bytes
+
+# Legacy Header (v1): 24 bytes
+# Magic(4s), Mode(B), ECC Parity(B), ECC Block Size(H), Payload Len(Q), CRC32(I), End Marker(4s)
+HEADER_STRUCT_FORMAT_V1 = '>4sBBHQI4s'
+HEADER_BYTE_SIZE_V1 = struct.calcsize(HEADER_STRUCT_FORMAT_V1)  # 24 bytes
+
+# Extended Header (v2 with 32-byte SHA-256): 56 bytes
+# Magic(4s), Mode(B), ECC Parity(B), ECC Block Size(H), Payload Len(Q), CRC32(I), SHA256(32s), End Marker(4s)
+HEADER_STRUCT_FORMAT_V2 = '>4sBBHQI32s4s'
+HEADER_BYTE_SIZE_V2 = struct.calcsize(HEADER_STRUCT_FORMAT_V2)  # 56 bytes
+
+HEADER_STRUCT_FORMAT = HEADER_STRUCT_FORMAT_V2
+HEADER_BYTE_SIZE = HEADER_BYTE_SIZE_V2
 
 MODE_RGB = 'RGB'
 MODE_MONO = 'L'
@@ -266,44 +295,77 @@ class VisualGridDetector:
         fh, fw = frame_bgr.shape[:2]
         offset = scale // 2
 
-        # Verify Row 0 has space for 8 pixels in RGB (24 bytes)
-        if x + 8 * scale > fw or y + scale > fh:
+        # Check RGB: requires at least 8 pixels (v1 24B) up to 19 pixels (v2 56B)
+        max_rgb_pixels = min(19, (fw - x) // scale) if scale > 0 else 0
+        if max_rgb_pixels < 8 or y + scale > fh:
             return None
 
-        # Sample Row 0 header pixels (8 pixels = 24 bytes in RGB)
-        sample_x = [x + i * scale + offset for i in range(8)]
+        # Sample candidate header pixels
+        sample_x = [x + i * scale + offset for i in range(max_rgb_pixels)]
         sample_y = y + offset
         sampled_bgr = frame_bgr[sample_y, sample_x, :]
         row0_rgb = sampled_bgr[:, [2, 1, 0]].tobytes()
 
-        if len(row0_rgb) < HEADER_BYTE_SIZE:
-            return None
+        has_sha256 = False
+        expected_sha256 = None
+        magic = None
+        mode = None
 
-        if row0_rgb[:4] != HEADER_MAGIC:
-            # Check monochrome (1 byte per pixel, needs 24 pixels)
-            if x + 24 * scale > fw:
-                return None
-            sample_mono_x = [x + i * scale + offset for i in range(24)]
-            row0_mono = frame_bgr[sample_y, sample_mono_x, 0].tobytes()
-            if row0_mono[:4] != HEADER_MAGIC:
-                return None
-            mode = MODE_MONO
-            header_bytes = row0_mono[:HEADER_BYTE_SIZE]
-        else:
+        if len(row0_rgb) >= 4 and row0_rgb[:4] == HEADER_MAGIC:
             mode = MODE_RGB
-            header_bytes = row0_rgb[:HEADER_BYTE_SIZE]
+            # Check for 56-byte V2 header first
+            if len(row0_rgb) >= HEADER_BYTE_SIZE_V2 and row0_rgb[52:56] == HEADER_END:
+                try:
+                    magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, raw_sha, end_marker = struct.unpack(
+                        HEADER_STRUCT_FORMAT_V2,
+                        row0_rgb[:HEADER_BYTE_SIZE_V2]
+                    )
+                    has_sha256 = True
+                    expected_sha256 = raw_sha.hex().lower()
+                except Exception:
+                    magic = None
+            # Check for 24-byte V1 legacy header
+            elif len(row0_rgb) >= HEADER_BYTE_SIZE_V1 and row0_rgb[20:24] == HEADER_END:
+                try:
+                    magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, end_marker = struct.unpack(
+                        HEADER_STRUCT_FORMAT_V1,
+                        row0_rgb[:HEADER_BYTE_SIZE_V1]
+                    )
+                except Exception:
+                    magic = None
 
-        # Parse Header
-        try:
-            magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, end_marker = struct.unpack(
-                HEADER_STRUCT_FORMAT,
-                header_bytes
-            )
-        except Exception:
-            return None
+        # Check Monochrome mode if not RGB magic
+        if magic is None or magic != HEADER_MAGIC:
+            max_mono_pixels = min(56, (fw - x) // scale) if scale > 0 else 0
+            if max_mono_pixels < 24 or y + scale > fh:
+                return None
+            sample_mono_x = [x + i * scale + offset for i in range(max_mono_pixels)]
+            row0_mono = frame_bgr[sample_y, sample_mono_x, 0].tobytes()
 
-        if magic != HEADER_MAGIC or end_marker != HEADER_END:
-            return None
+            if len(row0_mono) >= 4 and row0_mono[:4] == HEADER_MAGIC:
+                mode = MODE_MONO
+                if len(row0_mono) >= HEADER_BYTE_SIZE_V2 and row0_mono[52:56] == HEADER_END:
+                    try:
+                        magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, raw_sha, end_marker = struct.unpack(
+                            HEADER_STRUCT_FORMAT_V2,
+                            row0_mono[:HEADER_BYTE_SIZE_V2]
+                        )
+                        has_sha256 = True
+                        expected_sha256 = raw_sha.hex().lower()
+                    except Exception:
+                        return None
+                elif len(row0_mono) >= HEADER_BYTE_SIZE_V1 and row0_mono[20:24] == HEADER_END:
+                    try:
+                        magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, end_marker = struct.unpack(
+                            HEADER_STRUCT_FORMAT_V1,
+                            row0_mono[:HEADER_BYTE_SIZE_V1]
+                        )
+                    except Exception:
+                        return None
+                else:
+                    return None
+            else:
+                return None
 
         # Calculate Total Expected Encoded Bytes
         if ecc_parity > 0:
@@ -356,20 +418,30 @@ class VisualGridDetector:
             calculated_crc = zlib.crc32(corrected_payload) & 0xFFFFFFFF
             is_crc_valid = (calculated_crc == expected_crc)
 
+            # Real-Time SHA-256 Digest Calculation & Verification
+            calculated_sha256 = hashlib.sha256(corrected_payload).hexdigest().lower()
+            is_sha256_valid = True
+            if has_sha256 and expected_sha256 and expected_sha256 != ("00" * 32):
+                is_sha256_valid = (calculated_sha256 == expected_sha256)
+
             if is_crc_valid:
                 return {
                     "header": {
-                        "magic": magic.decode(errors='ignore'),
+                        "magic": magic.decode(errors='ignore') if isinstance(magic, (bytes, bytearray)) else str(magic),
                         "mode": ID_TO_MODE.get(mode_id, 'UNKNOWN'),
                         "ecc_parity": ecc_parity,
                         "ecc_block_size": ecc_block_size,
                         "payload_len": payload_len,
                         "expected_crc": expected_crc,
                         "expected_crc_hex": f"0x{expected_crc:08X}",
+                        "expected_sha256": expected_sha256,
+                        "has_sha256": has_sha256,
                     },
                     "calculated_crc": calculated_crc,
                     "calculated_crc_hex": f"0x{calculated_crc:08X}",
+                    "calculated_sha256": calculated_sha256,
                     "is_crc_valid": True,
+                    "is_sha256_valid": is_sha256_valid,
                     "scale": scale,
                     "grid_dims": (w_cand, h_cand),
                     "roi": (x, y, grid_px_w, grid_px_h),
@@ -411,33 +483,59 @@ class VisualGridDetector:
             # Convert to RGB bytes
             row0_rgb = row0_bgr[:, [2, 1, 0]].tobytes()
 
-            # Fast check: does Row 0 start with VCDC magic bytes?
-            if len(row0_rgb) < HEADER_BYTE_SIZE:
-                continue
+            has_sha256 = False
+            expected_sha256 = None
+            magic = None
+            mode = None
 
-            if row0_rgb[:4] != HEADER_MAGIC:
+            if len(row0_rgb) >= 4 and row0_rgb[:4] == HEADER_MAGIC:
+                mode = MODE_RGB
+                if len(row0_rgb) >= HEADER_BYTE_SIZE_V2 and row0_rgb[52:56] == HEADER_END:
+                    try:
+                        magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, raw_sha, end_marker = struct.unpack(
+                            HEADER_STRUCT_FORMAT_V2,
+                            row0_rgb[:HEADER_BYTE_SIZE_V2]
+                        )
+                        has_sha256 = True
+                        expected_sha256 = raw_sha.hex().lower()
+                    except Exception:
+                        magic = None
+                elif len(row0_rgb) >= HEADER_BYTE_SIZE_V1 and row0_rgb[20:24] == HEADER_END:
+                    try:
+                        magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, end_marker = struct.unpack(
+                            HEADER_STRUCT_FORMAT_V1,
+                            row0_rgb[:HEADER_BYTE_SIZE_V1]
+                        )
+                    except Exception:
+                        magic = None
+
+            if magic is None or magic != HEADER_MAGIC:
                 # Also check monochrome (Luminance channel)
                 mono_row0 = region[offset, offset::scale, 0].tobytes()
-                if mono_row0[:4] != HEADER_MAGIC:
-                    continue
-                else:
+                if len(mono_row0) >= 4 and mono_row0[:4] == HEADER_MAGIC:
                     mode = MODE_MONO
-                    header_bytes = mono_row0[:HEADER_BYTE_SIZE]
-            else:
-                mode = MODE_RGB
-                header_bytes = row0_rgb[:HEADER_BYTE_SIZE]
-
-            # Parse Header
-            try:
-                magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, end_marker = struct.unpack(
-                    HEADER_STRUCT_FORMAT,
-                    header_bytes
-                )
-            except Exception:
-                continue
-
-            if magic != HEADER_MAGIC or end_marker != HEADER_END:
-                continue
+                    if len(mono_row0) >= HEADER_BYTE_SIZE_V2 and mono_row0[52:56] == HEADER_END:
+                        try:
+                            magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, raw_sha, end_marker = struct.unpack(
+                                HEADER_STRUCT_FORMAT_V2,
+                                mono_row0[:HEADER_BYTE_SIZE_V2]
+                            )
+                            has_sha256 = True
+                            expected_sha256 = raw_sha.hex().lower()
+                        except Exception:
+                            continue
+                    elif len(mono_row0) >= HEADER_BYTE_SIZE_V1 and mono_row0[20:24] == HEADER_END:
+                        try:
+                            magic, mode_id, ecc_parity, ecc_block_size, payload_len, expected_crc, end_marker = struct.unpack(
+                                HEADER_STRUCT_FORMAT_V1,
+                                mono_row0[:HEADER_BYTE_SIZE_V1]
+                            )
+                        except Exception:
+                            continue
+                    else:
+                        continue
+                else:
+                    continue
 
             # Valid header found! Extract all rows using center sampling
             extracted = self._extract_payload(region, orig_w, orig_h, scale, mode, payload_len, ecc_parity, ecc_block_size)
@@ -458,19 +556,29 @@ class VisualGridDetector:
             calculated_crc = zlib.crc32(corrected_payload) & 0xFFFFFFFF
             is_crc_valid = (calculated_crc == expected_crc)
 
+            # Real-Time SHA-256 Digest Calculation & Verification
+            calculated_sha256 = hashlib.sha256(corrected_payload).hexdigest().lower()
+            is_sha256_valid = True
+            if has_sha256 and expected_sha256 and expected_sha256 != ("00" * 32):
+                is_sha256_valid = (calculated_sha256 == expected_sha256)
+
             return {
                 "header": {
-                    "magic": magic.decode(errors='ignore'),
+                    "magic": magic.decode(errors='ignore') if isinstance(magic, (bytes, bytearray)) else str(magic),
                     "mode": ID_TO_MODE.get(mode_id, 'UNKNOWN'),
                     "ecc_parity": ecc_parity,
                     "ecc_block_size": ecc_block_size,
                     "payload_len": payload_len,
                     "expected_crc": expected_crc,
                     "expected_crc_hex": f"0x{expected_crc:08X}",
+                    "expected_sha256": expected_sha256,
+                    "has_sha256": has_sha256,
                 },
                 "calculated_crc": calculated_crc,
                 "calculated_crc_hex": f"0x{calculated_crc:08X}",
+                "calculated_sha256": calculated_sha256,
                 "is_crc_valid": is_crc_valid,
+                "is_sha256_valid": is_sha256_valid,
                 "scale": scale,
                 "grid_dims": (orig_w, orig_h),
                 "roi": (roi_x, roi_y, roi_w, roi_h),
@@ -660,9 +768,15 @@ class HUDOverlayRenderer:
         # 2. Status Badge
         badge_y = 38
         if decode_res is not None and decode_res["is_crc_valid"]:
-            if decode_res["corrected_count"] > 0:
-                badge_text = f"LOCKED: RS REPAIRED (+{decode_res['corrected_count']} bytes)"
+            if not decode_res.get("is_sha256_valid", True):
+                badge_text = "SHA-256 REJECTED (BIT MISMATCH)"
+                badge_color = self.COLOR_ROSE
+            elif decode_res["corrected_count"] > 0:
+                badge_text = f"LOCKED: RS REPAIRED (+{decode_res['corrected_count']}B) | SHA-256 PASS"
                 badge_color = self.COLOR_AMBER
+            elif decode_res.get("has_sha256"):
+                badge_text = "LOCKED: CRC32 & SHA-256 VERIFIED"
+                badge_color = self.COLOR_EMERALD
             else:
                 badge_text = "LOCKED: CRC32 VERIFIED"
                 badge_color = self.COLOR_EMERALD
@@ -706,7 +820,8 @@ class HUDOverlayRenderer:
         cv2.putText(canvas, f'"{snippet_clean}"', (col3_x, panel_y + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.COLOR_WHITE, 1, cv2.LINE_AA)
 
         if decode_res is not None:
-            crc_info = f"CRC32: {decode_res['calculated_crc_hex']} | Scale: {decode_res['scale']}x | Grid: {decode_res['grid_dims'][0]}x{decode_res['grid_dims'][1]}"
+            sha_sub = f" | SHA: {decode_res['calculated_sha256'][:8]}.." if decode_res.get('calculated_sha256') else ""
+            crc_info = f"CRC: {decode_res['calculated_crc_hex']}{sha_sub} | Scale: {decode_res['scale']}x | Grid: {decode_res['grid_dims'][0]}x{decode_res['grid_dims'][1]}"
             cv2.putText(canvas, crc_info, (col3_x, panel_y + 64), cv2.FONT_HERSHEY_SIMPLEX, 0.35, self.COLOR_MUTED, 1, cv2.LINE_AA)
 
         # 4. Target Bounding Box
@@ -828,14 +943,16 @@ class SyntheticStreamCapture:
             encoded = data
 
         total_bytes = len(encoded)
+        sha_bytes = hashlib.sha256(data).digest()
         header_bytes = struct.pack(
-            HEADER_STRUCT_FORMAT,
+            HEADER_STRUCT_FORMAT_V2,
             HEADER_MAGIC,
             MODE_IDS[MODE_RGB],
             ecc_parity,
             ecc_block_size,
             payload_len,
             crc,
+            sha_bytes,
             HEADER_END
         )
 
@@ -876,16 +993,21 @@ def run_live_stream_decoder(
     log_file_path: Optional[str] = None,
     headless: bool = False,
     synthetic: bool = False,
-    max_frames: Optional[int] = None
+    max_frames: Optional[int] = None,
+    expected_sha256: Optional[str] = None
 ):
     """
     Main loop for live video stream decoding.
     Captures frames, detects visual data grids, recovers bytes with Reed-Solomon,
-    verifies CRC32, displays live HUD overlays, and writes reconstructed output.
+    verifies CRC32 & SHA-256 integrity, displays live HUD overlays, and writes reconstructed output.
     """
+    if not NUMPY_AVAILABLE:
+        print("[FATAL] numpy is not installed. Please install it with: pip install numpy", file=sys.stderr)
+        sys.exit(1)
+
     if not OPENCV_AVAILABLE:
-        print("[FATAL] OpenCV is not available. Exiting.", file=sys.stderr)
-        return
+        print("[FATAL] OpenCV (cv2) is not installed. Please install it with: pip install opencv-python", file=sys.stderr)
+        sys.exit(1)
 
     print("=" * 78)
     print("      VISUAL DATA CODEC: REAL-TIME VIDEO STREAM DECODER")
@@ -894,6 +1016,8 @@ def run_live_stream_decoder(
     print(f" Target Resolution: {width}x{height} @ {fps} FPS")
     print(f" Reed-Solomon FEC: {'ENABLED (reedsolo available)' if REEDSOLO_AVAILABLE else 'DISABLED (pip install reedsolo)'}")
     print(f" Display Mode: {'HEADLESS (Terminal Dashboard)' if headless else 'GUI (OpenCV Window)'}")
+    if expected_sha256:
+        print(f" Target SHA-256: {expected_sha256.lower()}")
     if output_file_path:
         print(f" Output Reassembly File: {output_file_path}")
     print("=" * 78)
@@ -930,6 +1054,15 @@ def run_live_stream_decoder(
     metrics = MetricsTracker(window_seconds=1.0)
     hud = HUDOverlayRenderer()
 
+    # Initialize Real-Time Data Integrity Verifier
+    if HAS_VERIFIER_MODULE:
+        verifier = StreamIntegrityVerifier(
+            source_identifier=source_label,
+            expected_sha256=expected_sha256
+        )
+    else:
+        verifier = None
+
     # Reassembly state
     last_crc = None
     last_text_snippet = ""
@@ -940,7 +1073,7 @@ def run_live_stream_decoder(
     log_handle = None
     if log_file_path:
         log_handle = open(log_file_path, "w")
-        log_handle.write("timestamp,fps,kbps,payload_bytes,crc32,ecc_errors_fixed,status\n")
+        log_handle.write("timestamp,fps,kbps,payload_bytes,crc32,sha256,ecc_errors_fixed,status\n")
 
     window_title = "Visual Data Codec - Live Video Stream Decoder"
     gui_active = not headless
@@ -967,6 +1100,31 @@ def run_live_stream_decoder(
                 is_new_chunk = (curr_crc != last_crc)
                 if is_new_chunk:
                     last_crc = curr_crc
+
+                    # Check chunk-level SHA-256 if embedded in V2 header
+                    chunk_sha_valid = decode_res.get("is_sha256_valid", True)
+                    calc_sha = decode_res.get("calculated_sha256", "")
+                    hdr_sha = decode_res["header"].get("expected_sha256")
+
+                    if not chunk_sha_valid:
+                        # Automatically reject corrupted chunks or flag bad sectors
+                        metrics.record_decoded_payload(0, 0, is_valid=False)
+                        print(f"[{time.strftime('%H:%M:%S')}] [SHA-256 REJECTED] Mismatch on chunk! Expected: {hdr_sha} != Calc: {calc_sha}")
+                        continue
+
+                    # Feed into StreamIntegrityVerifier
+                    if verifier is not None:
+                        is_valid_chunk, v_msg = verifier.process_chunk(
+                            chunk_data=payload,
+                            chunk_index=metrics.total_frames_decoded,
+                            expected_chunk_crc=curr_crc,
+                            is_repaired=decode_res.get("is_repaired", False)
+                        )
+                        if not is_valid_chunk:
+                            metrics.record_decoded_payload(0, 0, is_valid=False)
+                            print(f"[{time.strftime('%H:%M:%S')}] [STREAM VERIFIER REJECTED] {v_msg}")
+                            continue
+
                     metrics.record_decoded_payload(
                         len(payload),
                         decode_res["corrected_count"],
@@ -982,6 +1140,9 @@ def run_live_stream_decoder(
                         last_text_snippet = f"Binary ({len(payload)} bytes)"
                         status_str = f"[RECV BINARY] {len(payload)} bytes | CRC: {decode_res['calculated_crc_hex']}"
 
+                    if decode_res.get("has_sha256") and hdr_sha:
+                        status_str += f" | SHA-256: {calc_sha[:10]}... (PASS)"
+
                     if decode_res["corrected_count"] > 0:
                         status_str += f" | (RS FEC Repaired {decode_res['corrected_count']} corrupted bytes!)"
 
@@ -994,7 +1155,7 @@ def run_live_stream_decoder(
 
                     # Write log entry
                     if log_handle:
-                        log_handle.write(f"{time.time():.3f},{metrics.current_fps:.1f},{metrics.current_kbps:.2f},{len(payload)},{decode_res['calculated_crc_hex']},{decode_res['corrected_count']},OK\n")
+                        log_handle.write(f"{time.time():.3f},{metrics.current_fps:.1f},{metrics.current_kbps:.2f},{len(payload)},{decode_res['calculated_crc_hex']},{calc_sha[:16]},{decode_res['corrected_count']},OK\n")
                         log_handle.flush()
             elif decode_res is not None and not decode_res["is_crc_valid"]:
                 metrics.record_decoded_payload(0, 0, is_valid=False)
@@ -1049,6 +1210,14 @@ def run_live_stream_decoder(
     print(f" Average Framerate:        {final_stats['fps']:.1f} FPS")
     print(f" RS Repaired Frames:       {metrics.total_frames_repaired}")
     print(f" Total RS Bytes Corrected: {metrics.total_errors_corrected} corrupted bytes repaired")
+
+    if verifier is not None:
+        report = verifier.finalize()
+        print(f" Cumulative Stream SHA-256: {report.calculated_sha256}")
+        if report.expected_sha256:
+            print(f" Target Stream SHA-256:     {report.expected_sha256}")
+            print(f" SHA-256 Integrity Match:   {'PASS (100% Bit-Exact)' if report.sha256_match else 'FAIL (Hash Mismatch!)'}")
+        print(f" Stream Integrity Status:   {report.integrity_status}")
     print("=" * 78)
 
 
@@ -1087,6 +1256,12 @@ def main():
         type=int,
         default=None,
         help="Expected visual pixel block scale (e.g. 10 for 10x upscale; default: auto-detect)"
+    )
+    parser.add_argument(
+        "--sha256",
+        type=str,
+        default=None,
+        help="Target SHA-256 cryptographic hash (64-char hex) to verify end-to-end payload integrity"
     )
     parser.add_argument(
         "--output-file", "-o",
@@ -1128,7 +1303,8 @@ def main():
         log_file_path=args.log_file,
         headless=args.headless,
         synthetic=args.test,
-        max_frames=args.max_frames
+        max_frames=args.max_frames,
+        expected_sha256=args.sha256
     )
 
 
